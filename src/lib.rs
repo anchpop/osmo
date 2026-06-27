@@ -63,11 +63,15 @@ use xxhash_rust::xxh3::xxh3_64;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// A pooled HTTP client tuned for high concurrency against one host.
+/// A pooled HTTP client tuned for high concurrency against one host. The timeouts ensure a
+/// stalled connection eventually errors (and is then retried) rather than hanging forever —
+/// `reqwest` has no default request timeout.
 fn pooled_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(256)
         .pool_idle_timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
         .build()
         .expect("failed to build HTTP client")
 }
