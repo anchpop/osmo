@@ -168,6 +168,52 @@ async fn r2_json_merge_unions_entries() {
     );
 }
 
+/// Keys with characters that S3 XML-escapes in LIST responses (apostrophe, ampersand,
+/// non-ASCII) must still round-trip. Regression test for `hors-d'œuvre.html` silently
+/// dropping on pull.
+#[tokio::test]
+#[ignore = "requires live R2 credentials + OSMO_TEST_BUCKET"]
+async fn r2_special_character_keys() {
+    let Some(bucket_name) = env("OSMO_TEST_BUCKET") else {
+        eprintln!("skipping: OSMO_TEST_BUCKET not set");
+        return;
+    };
+    if env("R2_ACCESS_KEY_ID")
+        .or_else(|| env("AWS_ACCESS_KEY_ID"))
+        .is_none()
+    {
+        eprintln!("skipping: R2/AWS access key not set");
+        return;
+    }
+    let bucket = Bucket {
+        bucket: bucket_name,
+        prefix: unique_prefix(),
+    };
+
+    let tricky = [
+        "wiktionary/french/hors-d'œuvre.html",
+        "a & b/c=d.txt",
+        "spaces and ünïcode/é.bin",
+    ];
+    let src = tempdir();
+    for (i, rel) in tricky.iter().enumerate() {
+        write_file(src.path(), rel, format!("content-{i}").as_bytes()).await;
+    }
+    let pushed = flush(src.path(), &bucket).await.expect("push");
+    assert_eq!(pushed.uploaded, tricky.len(), "all tricky keys uploaded");
+
+    let dst = tempdir();
+    ensure_pulled(dst.path(), &bucket).await;
+    for (i, rel) in tricky.iter().enumerate() {
+        let got = tokio::fs::read(dst.path().join(rel)).await;
+        assert_eq!(
+            got.ok().as_deref(),
+            Some(format!("content-{i}").as_bytes()),
+            "key did not round-trip: {rel}"
+        );
+    }
+}
+
 /// Minimal unique temp dir without pulling in the `tempfile` crate.
 fn tempdir() -> TempDir {
     let nanos = SystemTime::now()

@@ -1187,11 +1187,14 @@ fn extract_tags(xml: &str, tag: &str) -> Vec<String> {
 }
 
 fn xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
+    // `&amp;` must be decoded last so a nested entity like `&amp;apos;` (literal text
+    // `&apos;`) isn't double-unescaped.
+    s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
+        .replace("&apos;", "'")
         .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 // ===================================================================================
@@ -1435,6 +1438,18 @@ mod tests {
         assert_eq!(settings.jsonl_key_for("000.jsonl"), "id");
         // A path not matched by any rule falls back to the default key.
         assert_eq!(settings.jsonl_key_for("notes.txt"), "k");
+    }
+
+    #[test]
+    fn xml_unescape_entities() {
+        // Apostrophe (the bug): S3/R2 escapes it as `&apos;` in LIST keys. Non-ASCII like
+        // `œ` is returned raw and passes through unchanged.
+        assert_eq!(xml_unescape("hors-d&apos;œuvre"), "hors-d'œuvre");
+        assert_eq!(xml_unescape("a &amp; b"), "a & b");
+        assert_eq!(xml_unescape("&lt;k&gt;"), "<k>");
+        assert_eq!(xml_unescape("it&#39;s"), "it's");
+        // `&amp;apos;` is the literal text `&apos;`, not an apostrophe.
+        assert_eq!(xml_unescape("&amp;apos;"), "&apos;");
     }
 
     #[test]
