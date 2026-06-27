@@ -1,0 +1,27 @@
+[package]
+name = "osmo"
+version = "0.1.0"
+edition = "2021"
+description = "Sync a directory to/from an S3-compatible bucket (e.g. Cloudflare R2), with per-file merge strategies (union JSON/JSONL maps so nothing is lost across machines)."
+license = "MIT"
+repository = "https://github.com/anchpop/osmo"
+keywords = ["s3", "r2", "sync", "cache", "cloudflare"]
+categories = ["caching", "filesystem"]
+
+[dependencies]
+reqwest = { version = "0.11.20", default-features = false, features = ["default-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+tokio = { version = "1.21", features = ["fs", "sync", "time"] }
+futures = "0.3"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+dashmap = "6.1"
+log = "0.4"
+url = "2.5"
+
+[dev-dependencies]
+tokio = { version = "1.21", features = ["macros", "rt-multi-thread"] }
