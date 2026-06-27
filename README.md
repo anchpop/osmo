@@ -50,9 +50,13 @@ machine inherits it):
 | `content` | mutable blobs | content hash; last-writer-wins |
 | `json_merge` | a mutable JSON object | union top-level keys (local wins ties) |
 | `jsonl_merge` | append-only JSON Lines | union lines by `key` field (default `"k"`) |
+| `records` | append-only binary key→value log | union records by key (local wins ties) |
 
-`jsonl_merge` is the sweet spot for a **sharded key→value cache**: store entries as a few
-big `NNN.jsonl` files instead of millions of tiny ones, and osmo unions them losslessly.
+The `records` strategy is the sweet spot for a **sharded binary cache**: store entries as a
+few big append-only shard files instead of millions of tiny ones, with no base64/JSON
+bloat. Each record is `[u32-le key_len][key][u32-le val_len][val]` (values stored verbatim,
+e.g. zstd-compressed), and osmo unions them losslessly across machines. A trailing partial
+record from an interrupted append is ignored.
 
 ## Credentials
 

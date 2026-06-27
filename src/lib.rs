@@ -36,7 +36,10 @@
 //!   local wins on push).
 //! - `json_merge`: mutable JSON object; reconciled by unioning top-level keys.
 //! - `jsonl_merge`: append-only JSON Lines; reconciled by unioning lines keyed by a field
-//!   (`key`, default `"k"`). Ideal for a sharded key→value cache.
+//!   (`key`, default `"k"`).
+//! - `records`: append-only binary key→value log (`[u32 key_len][key][u32 val_len][val]`);
+//!   reconciled by unioning records by key. No base64/JSON overhead — best for a sharded
+//!   binary (e.g. zstd) key→value cache.
 //!
 //! Credentials come from the environment: `R2_ACCOUNT_ID` (or `R2_ENDPOINT`),
 //! `R2_ACCESS_KEY_ID` (or `AWS_ACCESS_KEY_ID`), `R2_SECRET_ACCESS_KEY` (or
@@ -271,6 +274,11 @@ enum Strategy {
     /// Append-only JSON Lines: fingerprinted by content, reconciled by *unioning* the
     /// lines keyed by a field (see [`FileRule::key`]).
     JsonlMerge,
+    /// Append-only binary key→value record log, reconciled by *unioning* records by key.
+    /// Each record is `[u32-le key_len][key][u32-le val_len][val]`; a trailing partial
+    /// record (e.g. from an interrupted append) is ignored. No base64/JSON overhead — the
+    /// values are stored verbatim, so this suits a binary (e.g. zstd) key→value cache.
+    Records,
 }
 
 impl Strategy {
@@ -432,7 +440,12 @@ async fn pull(dir: &Path, bucket: &Bucket) -> Result<Stats, Error> {
             };
             let to_write = match local {
                 // Mergeable strategy with a local copy: union local into remote.
-                Some(f) if matches!(strategy, Strategy::JsonMerge | Strategy::JsonlMerge) => {
+                Some(f)
+                    if matches!(
+                        strategy,
+                        Strategy::JsonMerge | Strategy::JsonlMerge | Strategy::Records
+                    ) =>
+                {
                     let local_bytes = tokio::fs::read(&f.path).await?;
                     merge(
                         strategy,
@@ -530,7 +543,7 @@ async fn push(dir: &Path, bucket: &Bucket) -> Result<Stats, Error> {
                         content: f.content_hash.map(|h| (f.rel.clone(), h)),
                     })
                 }
-                Strategy::JsonMerge | Strategy::JsonlMerge => {
+                Strategy::JsonMerge | Strategy::JsonlMerge | Strategy::Records => {
                     // Already in sync: just keep tracking its hash.
                     if remote_content_ref.get(&f.rel).copied() == f.content_hash {
                         return Ok(Outcome {
@@ -632,6 +645,7 @@ fn merge(strategy: Strategy, remote: &[u8], local: &[u8], jsonl_key: &str) -> Op
     match strategy {
         Strategy::JsonMerge => merge_json_maps(remote, local),
         Strategy::JsonlMerge => Some(merge_jsonl(remote, local, jsonl_key)),
+        Strategy::Records => Some(merge_records(remote, local)),
         Strategy::Path | Strategy::Content => None,
     }
 }
@@ -646,6 +660,59 @@ fn merge_json_maps(remote: &[u8], local: &[u8]) -> Option<Vec<u8>> {
         merged.insert(k, v);
     }
     serde_json::to_vec(&merged).ok()
+}
+
+/// Union two binary record logs by key (local wins on collision). Each record is
+/// `[u32-le key_len][key][u32-le val_len][val]`. A trailing partial record (e.g. from an
+/// interrupted append) is ignored. Output order: remote records first, then new local ones.
+fn merge_records(remote: &[u8], local: &[u8]) -> Vec<u8> {
+    let mut order: Vec<Vec<u8>> = Vec::new();
+    let mut by_key: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for (k, v) in parse_records(remote)
+        .into_iter()
+        .chain(parse_records(local))
+    {
+        if by_key.insert(k.clone(), v).is_none() {
+            order.push(k);
+        }
+    }
+    let mut out = Vec::new();
+    for k in order {
+        let v = &by_key[&k];
+        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        out.extend_from_slice(&k);
+        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+/// Parse a binary record log into `(key, value)` pairs, stopping at the first incomplete
+/// record (tolerant of a truncated trailing write).
+fn parse_records(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let read_len = |data: &[u8], at: usize| -> Option<usize> {
+        data.get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+    };
+    while let Some(key_len) = read_len(data, i) {
+        i += 4;
+        let Some(key) = data.get(i..i + key_len) else {
+            break;
+        };
+        i += key_len;
+        let Some(val_len) = read_len(data, i) else {
+            break;
+        };
+        i += 4;
+        let Some(val) = data.get(i..i + val_len) else {
+            break;
+        };
+        i += val_len;
+        out.push((key.to_vec(), val.to_vec()));
+    }
+    out
 }
 
 /// Union two JSON Lines files, keyed by the `key_field` of each line (local wins on
@@ -1364,6 +1431,42 @@ mod tests {
         assert_eq!(settings.jsonl_key_for("000.jsonl"), "id");
         // A path not matched by any rule falls back to the default key.
         assert_eq!(settings.jsonl_key_for("notes.txt"), "k");
+    }
+
+    #[test]
+    fn records_codec_and_merge() {
+        fn rec(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for (k, v) in pairs {
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(k);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v);
+            }
+            out
+        }
+
+        // Binary values (incl. a NUL byte) survive round-trip.
+        let remote = rec(&[(b"a", b"\x00\x01"), (b"b", b"two")]);
+        let local = rec(&[(b"b", b"BB"), (b"c", b"three")]);
+        let merged = merge_records(&remote, &local);
+        let parsed = parse_records(&merged);
+        assert_eq!(parsed.len(), 3, "union of distinct keys");
+        let get = |k: &[u8]| {
+            parsed
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(b"a").as_deref(), Some(&b"\x00\x01"[..]));
+        assert_eq!(get(b"b").as_deref(), Some(&b"BB"[..]), "local wins");
+        assert_eq!(get(b"c").as_deref(), Some(&b"three"[..]));
+
+        // A truncated trailing record is ignored, earlier records preserved.
+        let mut truncated = rec(&[(b"x", b"ok")]);
+        truncated.extend_from_slice(&99u32.to_le_bytes()); // claims a 99-byte key that isn't there
+        truncated.extend_from_slice(b"partial");
+        assert_eq!(parse_records(&truncated).len(), 1);
     }
 
     #[test]
